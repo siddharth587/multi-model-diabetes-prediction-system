@@ -625,7 +625,7 @@ FEATURE_COLS = [
     "smoking_history_ever","smoking_history_former","smoking_history_never",
     "smoking_history_not current",
 ]
-SMOKING_OPTIONS = ["No Info","never","former","current","ever","not current"]
+SMOKING_OPTIONS = ["Prefer not to say","never","former","current","ever","not current"]
 
 def build_features(gender, age, hypertension, heart_disease, bmi, hba1c, glucose, smoking):
     row = {c: 0 for c in FEATURE_COLS}
