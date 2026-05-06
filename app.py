@@ -746,7 +746,9 @@ def build_features(gender, age, hypertension, heart_disease, bmi, hba1c, glucose
     row["bmi"]                 = bmi
     row["HbA1c_level"]         = hba1c
     row["blood_glucose_level"] = glucose
-    key = f"smoking_history_{smoking}"
+    # "Prefer not to say" is stored in the model as "No Info"
+    smoking_mapped = "No Info" if smoking == "Prefer not to say" else smoking
+    key = f"smoking_history_{smoking_mapped}"
     if key in row:
         row[key] = 1
     return pd.DataFrame([row], columns=FEATURE_COLS)
@@ -781,6 +783,160 @@ def run_shap(model_name, model, df_input):
         return vals.flatten(), float(bv)
     except Exception as e:
         return None, None
+
+
+def run_lime(model, df_input, training_feature_cols):
+    """Compute LIME values and return list of (feature_rule, impact) tuples.
+
+    Background data strategy (mirrors the training notebook):
+    - Sample continuous features from realistic *non-diabetic* population ranges
+      so LIME's baseline reflects a healthy cohort, not a uniform distribution
+      that inflates the synthetic mean for clinical markers like glucose/HbA1c.
+    - Sample binary features (hypertension, heart_disease, gender) from their
+      approximate population prevalences.
+    - Treat the 6 smoking one-hot columns as a mutually exclusive group:
+      randomly assign exactly one category per background row, matching the
+      joint distribution seen at training time and preventing impossible states
+      (e.g. both 'current' and 'never' = 1 simultaneously).
+    """
+    try:
+        import lime
+        import lime.lime_tabular
+
+        rng = np.random.RandomState(42)
+        n_bg = 500   # more samples → more stable local linear model
+
+        # Realistic non-diabetic population ranges for continuous features
+        continuous_ranges = {
+            "age":                 (18, 80),
+            "bmi":                 (15.0, 45.0),
+            "HbA1c_level":         (4.0, 6.4),   # healthy/pre-diabetic ceiling
+            "blood_glucose_level": (70, 125),     # healthy/pre-diabetic ceiling
+        }
+
+        # Binary features sampled from approximate population prevalences
+        binary_prevalence = {
+            "gender":        0.50,   # ~50% male
+            "hypertension":  0.30,   # ~30% prevalence in general population
+            "heart_disease": 0.10,   # ~10% prevalence
+        }
+
+        # Smoking one-hot columns that exist in FEATURE_COLS — order matters
+        smoking_cols = [c for c in training_feature_cols if c.startswith("smoking_history_")]
+        # Approximate prevalence weights for each category
+        smoking_weights = {
+            "smoking_history_No Info":     0.37,
+            "smoking_history_never":       0.35,
+            "smoking_history_former":      0.09,
+            "smoking_history_not current": 0.09,
+            "smoking_history_ever":        0.06,
+            "smoking_history_current":     0.04,
+        }
+
+        bg = np.zeros((n_bg, len(training_feature_cols)), dtype=float)
+
+        for ci, col in enumerate(training_feature_cols):
+            if col in continuous_ranges:
+                lo, hi = continuous_ranges[col]
+                bg[:, ci] = rng.uniform(lo, hi, size=n_bg)
+            elif col in binary_prevalence:
+                p = binary_prevalence[col]
+                bg[:, ci] = rng.binomial(1, p, size=n_bg).astype(float)
+            # smoking cols handled below as a group
+
+        # Assign smoking history as a mutually exclusive one-hot group
+        if smoking_cols:
+            weights = np.array([smoking_weights.get(c, 1.0 / len(smoking_cols))
+                                 for c in smoking_cols])
+            weights = weights / weights.sum()
+            chosen = rng.choice(len(smoking_cols), size=n_bg, p=weights)
+            for row_i, cat_i in enumerate(chosen):
+                col_name = smoking_cols[cat_i]
+                ci = training_feature_cols.index(col_name)
+                bg[row_i, ci] = 1.0
+
+        explainer_lime = lime.lime_tabular.LimeTabularExplainer(
+            bg,
+            feature_names=training_feature_cols,
+            class_names=["Non-Diabetic", "Diabetic"],
+            mode="classification",
+            random_state=42,
+        )
+        lime_exp = explainer_lime.explain_instance(
+            df_input.values[0],
+            model.predict_proba,
+            num_features=10,
+        )
+        return lime_exp.as_list()   # [(rule_str, impact_float), ...]
+    except Exception:
+        return None
+
+
+def generate_ai_paragraph(pred, proba, shap_vals, lime_data, df_input):
+    """Build a plain-English clinical explanation paragraph from SHAP + LIME."""
+    gender_val  = "Male" if df_input["gender"].values[0] == 1 else "Female"
+    age_val     = int(df_input["age"].values[0])
+    hba1c_val   = float(df_input["HbA1c_level"].values[0])
+    glucose_val = int(df_input["blood_glucose_level"].values[0])
+    bmi_val     = float(df_input["bmi"].values[0])
+    outcome     = "high risk of diabetes" if pred == 1 else "low risk of diabetes"
+    # Always show diabetic probability for consistent clinical communication
+    conf        = f"{proba[1]*100:.1f}%" if proba is not None else "N/A"
+    conf_label  = "diabetic risk probability"
+
+    # Top SHAP driver
+    if shap_vals is not None:
+        top_idx   = int(np.argmax(np.abs(shap_vals)))
+        top_feat  = FEATURE_DISPLAY_NAMES.get(FEATURE_COLS[top_idx], FEATURE_COLS[top_idx])
+        top_sv    = shap_vals[top_idx]
+        shap_dir  = "significantly increased" if top_sv > 0 else "significantly decreased"
+    else:
+        top_feat, shap_dir = "HbA1c Level", "influenced"
+
+    # Top LIME driver (first item in list has highest |impact|)
+    if lime_data:
+        lime_rule   = lime_data[0][0]   # e.g. "HbA1c_level > 6.60"
+        lime_impact = lime_data[0][1]
+        lime_dir    = "pushing toward a diabetic prediction" if lime_impact > 0 else "supporting a non-diabetic prediction"
+        # Check whether LIME top signal agrees with the model prediction
+        lime_agrees = (lime_impact > 0 and pred == 1) or (lime_impact < 0 and pred == 0)
+        lime_corroborate_word = "corroborates" if lime_agrees else "partially contrasts"
+    else:
+        lime_rule, lime_dir = "HbA1c level", "influencing the result"
+        lime_agrees = True
+        lime_corroborate_word = "corroborates"
+
+    # Count SHAP risk vs protective features — limit to top 10 to match the text
+    if shap_vals is not None:
+        top10_idx = np.argsort(np.abs(shap_vals))[::-1][:10]
+        top10_vals = shap_vals[top10_idx]
+        n_risk = int(np.sum(top10_vals > 0))
+        n_prot = int(np.sum(top10_vals < 0))
+    else:
+        n_risk = 0
+        n_prot = 0
+
+    # Clinical flags
+    hba1c_note  = "elevated HbA1c (≥6.5% indicates diabetes)" if hba1c_val >= 6.5 else \
+                  "borderline HbA1c (5.7–6.4% is pre-diabetic range)" if hba1c_val >= 5.7 else \
+                  "normal HbA1c (<5.7%)"
+    glucose_note = "elevated blood glucose (≥126 mg/dL is a diabetic threshold)" if glucose_val >= 126 else \
+                   "borderline blood glucose (100–125 mg/dL is pre-diabetic)" if glucose_val >= 100 else \
+                   "normal blood glucose (<100 mg/dL)"
+    bmi_note    = "obese BMI (≥30)" if bmi_val >= 30 else \
+                  "overweight BMI (25–29.9)" if bmi_val >= 25 else "healthy BMI"
+
+    para = (
+        f"This {age_val}-year-old {gender_val} patient has been assessed as <strong>{'⚠️ ' if pred==1 else '✅ '}{outcome}</strong> "
+        f"with a <strong>{conf}</strong> {conf_label}. "
+        f"The patient presents with {hba1c_note}, {glucose_note}, and {bmi_note}. "
+        f"According to the <strong>SHAP analysis</strong>, <em>{top_feat}</em> had the largest individual influence on this prediction, "
+        f"having <em>{shap_dir}</em> the model's output. "
+        f"Across the top 10 features examined, {n_risk} factors elevated diabetic risk while {n_prot} acted as protective contributors. "
+        f"The <strong>LIME local explanation</strong> {lime_corroborate_word} this — the rule <code>{lime_rule}</code> was the strongest local signal, {lime_dir}. "
+        f"{'Immediate consultation with a healthcare professional is strongly advised, as early intervention and lifestyle modification can significantly improve outcomes.' if pred == 1 else 'The patient should maintain their current healthy habits — balanced diet, regular physical activity, and annual screening — to continue managing their risk effectively.'}"
+    )
+    return para
 
 
 def render_shap_section(shap_vals, feature_names, df_input):
@@ -938,6 +1094,91 @@ def render_shap_section(shap_vals, feature_names, df_input):
             "SHAP values are in log-odds space. "
             "A value of +0.3 means this feature shifted the model's log-odds toward diabetic by 0.3 units. "
             "base + Σ(SHAP) = log-odds → sigmoid → predicted probability."
+        )
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_lime_section(lime_data):
+    """Render a styled LIME bar chart + table."""
+    if lime_data is None:
+        st.warning("LIME explanation unavailable. Make sure `lime` is installed.")
+        return
+
+    rules   = [d[0] for d in lime_data]
+    impacts = [d[1] for d in lime_data]
+    colors  = ["#FF4664" if v > 0 else "#00F5A0" for v in impacts]
+
+    fig, ax = plt.subplots(figsize=(9, max(4.0, len(rules) * 0.52)))
+    fig.patch.set_facecolor("#071828")
+    ax.set_facecolor("#071828")
+
+    y_pos = np.arange(len(rules))
+    ax.barh(y_pos, impacts, height=0.60, color=colors, alpha=0.13, edgecolor="none")
+    bars = ax.barh(y_pos, impacts, height=0.50, color=colors, alpha=0.90, edgecolor="none")
+
+    max_abs = max(abs(v) for v in impacts) if impacts else 1.0
+    for bar, val, color in zip(bars, impacts, colors):
+        label = f"{val:+.4f}"
+        x_pos = val + max_abs * 0.02 if val >= 0 else val - max_abs * 0.02
+        ha    = "left" if val >= 0 else "right"
+        txt_color = "#FF8099" if val > 0 else "#7BFFCC"
+        ax.text(x_pos, bar.get_y() + bar.get_height() / 2,
+                label, va="center", ha=ha, fontsize=8.5,
+                fontweight="700", color=txt_color, fontfamily="monospace")
+
+    ax.axvline(0, color="#1A4A6A", linewidth=1.4, linestyle="--", zorder=3)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(rules, fontsize=8.5, color="#90BBD4", fontfamily="monospace")
+    ax.invert_yaxis()
+    ax.set_xlim(-max_abs * 1.4, max_abs * 1.4)
+    ax.set_xlabel("LIME Local Impact (contribution toward Diabetic class)",
+                  fontsize=9, color="#4E7A94", labelpad=8)
+    ax.set_title("LIME — Local Feature Contributions", fontsize=12,
+                 fontweight="700", color="#C8E0F0", pad=12)
+    ax.tick_params(axis="x", labelsize=8.5, labelcolor="#2A4E68", length=3)
+    ax.tick_params(axis="y", length=0)
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["left"].set_color("#0D2A40")
+    ax.spines["bottom"].set_color("#0D2A40")
+    ax.xaxis.grid(True, color="#0D2A40", linewidth=0.7, zorder=0)
+    ax.yaxis.grid(False)
+
+    pos_patch = mpatches.Patch(color="#FF4664", label="🔴  Positive → ↑ Increases diabetic risk")
+    neg_patch = mpatches.Patch(color="#00F5A0", label="🟢  Negative → ↓ Decreases diabetic risk")
+    ax.legend(handles=[pos_patch, neg_patch], fontsize=8.5, framealpha=0.0,
+              labelcolor="#A8C8E0", loc="lower right",
+              bbox_to_anchor=(1.0, -0.18), ncol=2)
+
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+
+    st.markdown('<div class="shap-panel">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="shap-title">🧩 Explainable AI — LIME Local Explanation</div>'
+        '<div class="shap-sub">'
+        'LIME (Local Interpretable Model-Agnostic Explanations) builds a simple local model '
+        'around <em>this specific patient</em> to explain why the prediction was made. '
+        '<span style="color:#FF8099;">Red / positive</span> bars indicate features that pushed toward a diabetic prediction; '
+        '<span style="color:#7BFFCC;">green / negative</span> bars indicate features that pushed away from it.'
+        '</div>',
+        unsafe_allow_html=True)
+
+    st.pyplot(fig, use_container_width=True)
+    plt.close()
+
+    # Table
+    with st.expander("📊 Full LIME Feature Contribution Table"):
+        lime_df = pd.DataFrame({
+            "Rank":       list(range(1, len(lime_data) + 1)),
+            "Feature Rule": rules,
+            "Impact":     [f"{v:+.4f}" for v in impacts],
+            "Direction":  ["↑ Increases Risk" if v > 0 else "↓ Decreases Risk" for v in impacts],
+        })
+        st.dataframe(lime_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "LIME fits a local linear model around this patient's input. "
+            "Each row shows a feature rule (e.g. HbA1c_level > 6.60) and how much it contributed to the prediction."
         )
 
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1248,12 +1489,30 @@ elif page == "Prediction":
                     </div>
                 </div>""", unsafe_allow_html=True)
 
-            # ── SHAP Section ────────────────────────────────────────────────
+            # ── SHAP + LIME + AI Paragraph ──────────────────────────────────
             st.markdown("<br>", unsafe_allow_html=True)
-            with st.spinner("Computing SHAP explanations…"):
-                shap_vals, base_val = run_shap(BEST_MODEL, model, df_input)
 
+            with st.spinner("Computing SHAP & LIME explanations…"):
+                shap_vals, base_val = run_shap(BEST_MODEL, model, df_input)
+                lime_data           = run_lime(model, df_input, FEATURE_COLS)
+
+            # ── AI-generated plain-English paragraph ────────────────────────
+            st.markdown('<div class="sec-label">🧠 AI Clinical Summary</div>', unsafe_allow_html=True)
+            para = generate_ai_paragraph(pred, proba, shap_vals, lime_data, df_input)
+            st.markdown(
+                f'<div style="background:rgba(0,144,184,0.07);border:1px solid rgba(0,212,255,0.18);'
+                f'border-radius:14px;padding:1.2rem 1.6rem;margin-bottom:1.2rem;'
+                f'font-size:0.88rem;color:#A8C8E0;line-height:1.85;">'
+                f'<span style="font-size:1.1rem;">🩺</span>&nbsp; {para}'
+                f'</div>',
+                unsafe_allow_html=True)
+
+            # ── SHAP ────────────────────────────────────────────────────────
             render_shap_section(shap_vals, FEATURE_COLS, df_input)
+
+            # ── LIME ────────────────────────────────────────────────────────
+            st.markdown("<br>", unsafe_allow_html=True)
+            render_lime_section(lime_data)
 
             st.markdown("<br>", unsafe_allow_html=True)
             with st.expander("📄 View Input Summary"):
