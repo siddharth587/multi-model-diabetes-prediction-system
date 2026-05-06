@@ -7,3 +7,8 @@ matplotlib
 seaborn
 pillow
 joblib
+lightgbm
+xgboost
+catboost
+shap
+ 
